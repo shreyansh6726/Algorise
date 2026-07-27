@@ -5,3 +5,7 @@ numpy
 requests
 python-dotenv
 torch
+pymongo[srv]
+passlib[bcrypt]
+python-jose[cryptography]
+email-validator

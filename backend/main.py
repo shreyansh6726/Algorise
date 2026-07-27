@@ -1,12 +1,35 @@
 import datetime
+import os
+from pathlib import Path
+
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from pydantic import BaseModel, EmailStr, Field
+from pymongo import ASCENDING, MongoClient
+from pymongo.errors import DuplicateKeyError, PyMongoError
 from typing import Optional, List, Dict
+from dotenv import load_dotenv
 
 from data_fetcher import resolve_symbol, fetch_stock_data
 from model import train_and_predict
+
+load_dotenv(Path(__file__).with_name(".env"))
+
+MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "algorise-dev-secret")
+JWT_ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_DAYS = 7
+
+pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+bearer_scheme = HTTPBearer(auto_error=False)
+
+mongo_client = None
+users_collection = None
+mongo_ready = False
 
 app = FastAPI(
     title="Algorise Stock LSTM Predictor API",
@@ -28,6 +51,30 @@ class PredictionRequest(BaseModel):
     tenure: str = Field(..., description="Prediction tenure: 1h, 1d, 2d, 1w, or 1m")
     api_key: Optional[str] = Field(None, description="Optional Twelve Data API key")
 
+
+class SignupRequest(BaseModel):
+    name: str = Field(..., min_length=2, max_length=80)
+    user_id: str = Field(..., min_length=3, max_length=40, pattern=r"^[A-Za-z0-9._-]+$")
+    email: EmailStr
+    password: str = Field(..., min_length=8, max_length=128)
+
+
+class LoginRequest(BaseModel):
+    user_id: str = Field(..., min_length=3, max_length=40)
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+class AuthUser(BaseModel):
+    name: str
+    user_id: str
+    email: EmailStr
+
+
+class AuthResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: AuthUser
+
 class StockPoint(BaseModel):
     time: str
     value: float
@@ -42,6 +89,126 @@ class PredictionResponse(BaseModel):
     last_price: float
     predicted_end_price: float
     percentage_change: float
+
+
+def get_users_collection():
+    global mongo_client, users_collection, mongo_ready
+
+    if not MONGODB_URI:
+        raise HTTPException(
+            status_code=500,
+            detail="MONGODB_URI is not configured. Add it to backend/.env before using authentication.",
+        )
+
+    if users_collection is not None:
+        return users_collection
+
+    try:
+        mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+        database = mongo_client.get_default_database()
+        if database is None:
+            database = mongo_client["algorise"]
+
+        users_collection = database["users"]
+
+        if not mongo_ready:
+            users_collection.create_index([("user_id", ASCENDING)], unique=True)
+            users_collection.create_index([("email", ASCENDING)], unique=True)
+            mongo_ready = True
+
+        return users_collection
+    except PyMongoError as exc:
+        raise HTTPException(status_code=500, detail=f"MongoDB connection failed: {str(exc)}")
+
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def create_access_token(user_id: str) -> str:
+    expiry = datetime.datetime.utcnow() + datetime.timedelta(days=ACCESS_TOKEN_EXPIRE_DAYS)
+    payload = {"sub": user_id, "exp": expiry}
+    return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+
+
+def serialize_user(user_doc) -> AuthUser:
+    return AuthUser(
+        name=user_doc["name"],
+        user_id=user_doc["user_id"],
+        email=user_doc["email"],
+    )
+
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)):
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Not authenticated.")
+
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid authentication token.")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired authentication token.")
+
+    users = get_users_collection()
+    user_doc = users.find_one({"user_id": user_id})
+    if not user_doc:
+        raise HTTPException(status_code=401, detail="Authenticated user not found.")
+
+    return serialize_user(user_doc)
+
+
+@app.post("/api/auth/signup", response_model=AuthResponse)
+def signup(request: SignupRequest):
+    users = get_users_collection()
+
+    normalized_user_id = request.user_id.strip()
+    normalized_email = request.email.lower()
+
+    if users.find_one({"user_id": normalized_user_id}):
+        raise HTTPException(status_code=400, detail="User ID already exists.")
+
+    if users.find_one({"email": normalized_email}):
+        raise HTTPException(status_code=400, detail="Email is already registered.")
+
+    user_document = {
+        "name": request.name.strip(),
+        "user_id": normalized_user_id,
+        "email": normalized_email,
+        "password_hash": hash_password(request.password),
+        "created_at": datetime.datetime.utcnow(),
+    }
+
+    try:
+        users.insert_one(user_document)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=400, detail="User ID or email already exists.")
+
+    token = create_access_token(normalized_user_id)
+    return AuthResponse(access_token=token, user=serialize_user(user_document))
+
+
+@app.post("/api/auth/login", response_model=AuthResponse)
+def login(request: LoginRequest):
+    users = get_users_collection()
+    normalized_user_id = request.user_id.strip()
+    user_doc = users.find_one({"user_id": normalized_user_id})
+
+    if not user_doc or not verify_password(request.password, user_doc["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid user ID or password.")
+
+    token = create_access_token(user_doc["user_id"])
+    return AuthResponse(access_token=token, user=serialize_user(user_doc))
+
+
+@app.get("/api/auth/me", response_model=AuthUser)
+def read_current_user(current_user: AuthUser = Depends(get_current_user)):
+    return current_user
 
 # Mapping of tenure options to Twelve Data parameters
 TENURE_MAPPING = {
@@ -102,7 +269,7 @@ def generate_future_timestamps(start_time_str: str, interval: str, steps: int) -
 
 
 @app.get("/api/search")
-def search_company(q: str, api_key: Optional[str] = None):
+def search_company(q: str, api_key: Optional[str] = None, current_user: AuthUser = Depends(get_current_user)):
     """
     Endpoint to search and select a company by name.
     """
@@ -115,7 +282,7 @@ def search_company(q: str, api_key: Optional[str] = None):
 
 
 @app.post("/api/predict", response_model=PredictionResponse)
-def predict_stock(request: PredictionRequest):
+def predict_stock(request: PredictionRequest, current_user: AuthUser = Depends(get_current_user)):
     """
     Predicts stock prices based on the company name and selected tenure.
     Trains an LSTM model on the fly and returns historical and predicted points.
