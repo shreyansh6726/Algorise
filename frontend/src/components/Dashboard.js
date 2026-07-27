@@ -34,7 +34,6 @@ export default function Dashboard({ onBack }) {
 
   // Search debounce ref
   const searchTimeoutRef = useRef(null);
-  const selectedCompanyRef = useRef('');
 
   // Auto-focus search on load
   const searchInputRef = useRef(null);
@@ -54,44 +53,32 @@ export default function Dashboard({ onBack }) {
       return;
     }
 
-    if (searchQuery === selectedCompanyRef.current) {
-      setSearchResults([]);
-      setShowDropdown(false);
-      return;
-    }
-
     if (searchTimeoutRef.current) {
       clearTimeout(searchTimeoutRef.current);
     }
-
-    let isActive = true;
 
     searchTimeoutRef.current = setTimeout(async () => {
       try {
         const queryParams = new URLSearchParams({ q: searchQuery });
         
         const response = await fetch(`${API_BASE_URL}/api/search?${queryParams.toString()}`);
-        if (isActive && response.ok) {
+        if (response.ok) {
           const data = await response.json();
           setSearchResults(data);
           setShowDropdown(data.length > 0);
         }
       } catch (err) {
-        if (isActive) {
-          console.error("Error fetching suggestions:", err);
-        }
+        console.error("Error fetching suggestions:", err);
       }
     }, 300);
 
     return () => {
-      isActive = false;
       if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
     };
   }, [searchQuery]);
 
   // Handle autocomplete click
   const handleSelectCompany = (company) => {
-    selectedCompanyRef.current = company.name;
     setSearchQuery(company.name);
     setSearchResults([]);
     setShowDropdown(false);
@@ -282,7 +269,6 @@ export default function Dashboard({ onBack }) {
                 placeholder="Search company by name (e.g. Apple, Google, Tesla)..."
                 value={searchQuery}
                 onChange={(e) => {
-                  selectedCompanyRef.current = '';
                   setSearchQuery(e.target.value);
                   setError(null);
                 }}
