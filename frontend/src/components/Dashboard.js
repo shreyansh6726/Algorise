@@ -8,12 +8,13 @@ import {
   Play, 
   Loader2,
   Calendar,
-  AlertTriangle
+  AlertTriangle,
+  LogOut
 } from 'lucide-react';
 import StockChart from './StockChart';
 import { API_BASE_URL } from '../config';
 
-export default function Dashboard({ onBack }) {
+export default function Dashboard({ token, onLogout }) {
   // Inputs state
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState([]);
@@ -61,7 +62,17 @@ export default function Dashboard({ onBack }) {
       try {
         const queryParams = new URLSearchParams({ q: searchQuery });
         
-        const response = await fetch(`${API_BASE_URL}/api/search?${queryParams.toString()}`);
+        const response = await fetch(`${API_BASE_URL}/api/search?${queryParams.toString()}`, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+
+        if (response.status === 401) {
+          onLogout();
+          return;
+        }
+
         if (response.ok) {
           const data = await response.json();
           setSearchResults(data);
@@ -75,7 +86,7 @@ export default function Dashboard({ onBack }) {
     return () => {
       if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
     };
-  }, [searchQuery]);
+  }, [searchQuery, token, onLogout]);
 
   // Handle autocomplete click
   const handleSelectCompany = (company) => {
@@ -145,7 +156,10 @@ export default function Dashboard({ onBack }) {
     try {
       const res = await fetch(`${API_BASE_URL}/api/predict`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
         body: JSON.stringify({
           company_name: searchQuery,
           tenure: tenure
@@ -157,6 +171,10 @@ export default function Dashboard({ onBack }) {
 
       if (!res.ok) {
         const errorData = await res.json();
+        if (res.status === 401) {
+          onLogout();
+          return;
+        }
         throw new Error(errorData.detail || "Server error running predictions.");
       }
 
@@ -208,7 +226,7 @@ export default function Dashboard({ onBack }) {
     <div className="dashboard-layout animate-fade-in">
       {/* Sidebar Controls */}
       <div className="sidebar">
-        <div className="logo-container" onClick={onBack} style={{ cursor: 'pointer' }}>
+        <div className="logo-container">
           <TrendingUp size={24} style={{ color: 'var(--color-secondary)' }} />
           <span>Algorise AI</span>
         </div>
@@ -304,13 +322,15 @@ export default function Dashboard({ onBack }) {
                 {predictionData.is_mocked ? 'Simulated Data' : 'Live Data'}
               </span>
             )}
-            <button 
-              className="tenure-chip" 
-              style={{ border: '1px solid var(--border-standard)' }} 
-              onClick={onBack}
+            <button
+              className="tenure-chip auth-logout-button"
+              style={{ border: '1px solid var(--border-standard)', width: 'auto' }}
+              onClick={onLogout}
               disabled={loading}
+              title="Log out"
             >
-              Back to Welcome
+              <LogOut size={16} />
+              Logout
             </button>
           </div>
         </div>
